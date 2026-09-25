@@ -1,133 +1,184 @@
 /**
- * Smoke test for the Helius / Jupiter / SolanaPortal / Jito contract.
+ * Phase 1 smoke test — PumpPortal signal source, observe only.
  *
- * Purpose: verify the assumptions documented in CLAUDE.md against REAL
- * wallets and REAL API responses, before any dashboard or DB workflow
- * depends on them. Specifically checks:
+ * Connects ONE PumpPortal websocket, subscribes the given wallets, and
+ * prints every trade as the mirror engine will see it. Nothing is bought,
+ * nothing touches the DB, no private key is needed.
  *
- *   1. Helius transactionSubscribe delivers notifications for multiple
- *      watched wallets (accountInclude supports up to 50,000 addresses
- *      per Helius's docs — no plan-tier ambiguity like CoinVera had).
- *   2. The balance-delta buy detection in walletWatcher.ts actually
- *      identifies buys correctly against real transactions.
- *   3. dexMapper's program-ID resolution produces a dex SolanaPortal accepts.
- *   4. Jupiter Price API returns usable prices (and surfaces the known
- *      gap for pre-migration pump.fun tokens, if hit).
- *   5. (LIVE mode only) A full buy → confirm → read-back → sell round
- *      trip works end-to-end with real funds, using a tiny amount.
+ * What it verifies (Phase 1 gate: 24h, no missed trade):
+ *   1. Buys AND sells arrive for every watched wallet, on pump.fun and
+ *      PumpSwap (the pool column shows which).
+ *   2. `newTokenBalance` is present on sells, so sell % can be mirrored.
+ *      Any sell where sellPct is null is flagged.
+ *   3. Nothing unexpected is dropped: every non-trade message is printed.
+ *   4. Reconnects work and every blind window is recorded.
  *
- * ── Usage ──────────────────────────────────────────────────────────
+ * Cross-check afterwards: compare the JSONL file with each wallet's
+ * activity on GMGN/Solscan for the same period. Every trade there must
+ * be here.
  *
- *   DRY RUN (safe, default — no funds spent, just observes and logs):
- *     SMOKE_TEST_WALLETS=addr1,addr2 npm run smoke-test
+ * Usage:
+ *   PUMPPORTAL_API_KEY=... SMOKE_TEST_WALLETS=addr1,addr2 npm run smoke-test
  *
- *   LIVE (spends real SOL — see SMOKE_TEST_BUY_AMOUNT_SOL below):
- *     SMOKE_TEST_WALLETS=addr1,addr2 SMOKE_TEST_LIVE=true npm run smoke-test
- *
- * Pick at least 2 wallets that trade frequently on pump.fun/Raydium for a
- * realistic test. Let it run for a while; it does not exit on its own in
- * dry-run mode (Ctrl+C when satisfied). In LIVE mode it exits automatically
- * after completing one full round trip.
+ * Optional: SMOKE_TEST_OUT_DIR (default ./logs), SMOKE_TEST_SUMMARY_MIN (default 5).
+ * On Railway, stdout is enough: every line is also in the service logs.
  */
-import { WalletWatcher, type DetectedBuy } from '../src/services/walletWatcher.js';
-import { executeOrder, getActualTokenBalance } from '../src/services/solanaExecution.js';
-import { fetchTokenPrice } from '../src/services/priceService.js';
+import 'dotenv/config';
+import { appendFileSync, mkdirSync } from 'node:fs';
+import path from 'node:path';
+import { PumpPortalSource } from '../src/signals/pumpPortalSource.js';
+import type { TradeSignal } from '../src/signals/types.js';
 
-const addresses = (process.env.SMOKE_TEST_WALLETS ?? '').split(',').map((a) => a.trim()).filter(Boolean);
-const isLive = process.env.SMOKE_TEST_LIVE === 'true';
-const buyAmountSol = Number(process.env.SMOKE_TEST_BUY_AMOUNT_SOL ?? '0.01');
+const apiKey = process.env.PUMPPORTAL_API_KEY?.trim();
+const wallets = (process.env.SMOKE_TEST_WALLETS ?? '')
+  .split(',')
+  .map((a) => a.trim())
+  .filter(Boolean);
 
-if (addresses.length === 0) {
-  console.error('Set SMOKE_TEST_WALLETS to a comma-separated list of at least 2 wallet addresses.');
+if (!apiKey) {
+  console.error('Missing PUMPPORTAL_API_KEY.');
+  process.exit(1);
+}
+if (wallets.length === 0) {
+  console.error('Set SMOKE_TEST_WALLETS to a comma-separated list of wallet addresses.');
   process.exit(1);
 }
 
-console.log(`\n=== Hermes Copyist — Helius contract smoke test ===`);
-console.log(`Watching ${addresses.length} wallet(s): ${addresses.join(', ')}`);
-console.log(`Mode: ${isLive ? `LIVE — will spend ~${buyAmountSol} SOL on the first detected buy` : 'DRY RUN — observe only, no funds spent'}`);
-console.log(`Waiting for trade activity... (Ctrl+C to stop)\n`);
+const outDir = process.env.SMOKE_TEST_OUT_DIR ?? './logs';
+const summaryMin = Number(process.env.SMOKE_TEST_SUMMARY_MIN ?? '5');
+const startedAt = new Date();
+const outFile = path.join(outDir, `smoke-${startedAt.toISOString().replace(/[:.]/g, '-')}.jsonl`);
+let fileOk = true;
+try {
+  mkdirSync(outDir, { recursive: true });
+} catch {
+  fileOk = false;
+}
 
-const seenSigners = new Set<string>();
-let liveTestCompleted = false;
-
-const watcher = new WalletWatcher(addresses);
-
-// See every raw message Helius sends — subscription ack, every matching
-// transaction (not just recognized buys) — to eyeball the real shape
-// against what walletWatcher.ts assumes.
-watcher.on('raw', (data: any) => {
-  if (typeof data?.result === 'number' && data?.id !== undefined) {
-    console.log(`[ack] Subscription confirmed, id=${data.result}`);
-    return;
-  }
-  if (data?.method !== 'transactionNotification') return;
-
-  const sig = data.params?.result?.signature;
-  const meta = data.params?.result?.transaction?.meta;
-  const message = data.params?.result?.transaction?.transaction?.message;
-  const accountKeys = (message?.accountKeys ?? []).map((k: any) => (typeof k === 'string' ? k : k?.pubkey));
-
-  const matched = addresses.filter((a) => accountKeys.includes(a));
-  for (const signer of matched) {
-    if (!seenSigners.has(signer)) {
-      seenSigners.add(signer);
-      console.log(`\n[new signer seen] ${signer} (${seenSigners.size}/${addresses.length} watched wallets have shown activity so far)`);
-    }
-  }
-
-  const shapeOk = typeof sig === 'string' && Array.isArray(meta?.preTokenBalances) && Array.isArray(meta?.postTokenBalances);
-  console.log(`[tx] signature=${sig} matched=[${matched.join(', ')}] preTokenBalances=${meta?.preTokenBalances?.length} postTokenBalances=${meta?.postTokenBalances?.length} — shape ${shapeOk ? 'OK ✅' : 'UNEXPECTED ⚠️'}`);
-  if (!shapeOk) {
-    console.log(`  Full raw message for inspection: ${JSON.stringify(data)}`);
-  }
-});
-
-watcher.on('buy', async (detected: DetectedBuy) => {
-  console.log(`\n[buy detected] wallet=${detected.wallet.address} mint=${detected.mint} solAmount≈${detected.solAmount} dex="${detected.dex}" sig=${detected.parentSignature}`);
-
-  // Sanity-check the price lookup regardless of dry-run/live, since this
-  // is the piece most likely to have coverage gaps (see priceService.ts).
-  const price = await fetchTokenPrice(detected.mint);
-  if (price) {
-    console.log(`  Jupiter price lookup OK: ${JSON.stringify(price)}`);
-  } else {
-    console.log(`  ⚠️ Jupiter has no price for ${detected.mint} yet — likely a pre-migration bonding-curve token. This is the known gap documented in CLAUDE.md.`);
-  }
-
-  if (!isLive || liveTestCompleted) {
-    console.log(`  (dry run — not executing. Re-run with SMOKE_TEST_LIVE=true to test real execution.)`);
-    return;
-  }
-
-  liveTestCompleted = true; // only ever do one live round trip per run
-  console.log(`\n=== LIVE round trip starting (${buyAmountSol} SOL) ===`);
-
+function record(entry: Record<string, unknown>): void {
+  if (!fileOk) return;
   try {
-    console.log(`[1/4] Buying ${buyAmountSol} SOL of ${detected.mint} on ${detected.dex}...`);
-    const buySig = await executeOrder('smoke-test', 'buy', detected.mint, buyAmountSol, 15, 0.0005, detected.dex);
-    console.log(`  ✅ Buy confirmed: https://solscan.io/tx/${buySig}`);
-
-    console.log(`[2/4] Reading back actual on-chain token balance...`);
-    const tokenAmount = await getActualTokenBalance(detected.mint);
-    console.log(`  ✅ Balance: ${tokenAmount} tokens.`);
-
-    if (tokenAmount <= 0) {
-      console.error(`  ⚠️ Token balance came back as ${tokenAmount} — cannot sell back. Manual check needed on-chain.`);
-      process.exit(1);
-    }
-
-    console.log(`[3/4] Selling the full ${tokenAmount} tokens back on ${detected.dex}...`);
-    const sellSig = await executeOrder('smoke-test', 'sell', detected.mint, tokenAmount, 15, 0.0005, detected.dex);
-    console.log(`  ✅ Sell confirmed: https://solscan.io/tx/${sellSig}`);
-
-    console.log(`[4/4] Round trip complete. Contract verified end-to-end.`);
+    appendFileSync(outFile, JSON.stringify({ at: new Date().toISOString(), ...entry }) + '\n');
   } catch (err: any) {
-    console.error(`  ❌ Round trip failed: ${err.message}`);
-    console.error(`  This is exactly the kind of failure this smoke test exists to catch before the dashboard depends on it.`);
-  } finally {
-    console.log(`\nExiting smoke test.`);
-    process.exit(0);
+    fileOk = false;
+    console.warn(`[file] could not write ${outFile}: ${err.message} — continuing with stdout only`);
   }
+}
+
+const short = (s: string) => `${s.slice(0, 4)}…${s.slice(-4)}`;
+
+// ── counters for the periodic summary ─────────────────────────────
+const perWallet = new Map<string, { buys: number; sells: number; sellsWithoutPct: number }>();
+for (const w of wallets) perWallet.set(w, { buys: 0, sells: 0, sellsWithoutPct: 0 });
+const pools = new Map<string, number>();
+const buyersByMint = new Map<string, Set<string>>();
+const seenSignatures = new Set<string>();
+let duplicates = 0;
+let sellsWithoutSeenBuy = 0;
+let unparsedCount = 0;
+let disconnects = 0;
+let blindMs = 0;
+let disconnectedAt: Date | null = null;
+
+function onSignal(s: TradeSignal): void {
+  const dup = seenSignatures.has(`${s.signature}:${s.wallet}`);
+  seenSignatures.add(`${s.signature}:${s.wallet}`);
+  if (dup) duplicates += 1;
+
+  const stats = perWallet.get(s.wallet);
+  if (!stats) {
+    console.warn(`[unexpected] trade from a wallet we did not subscribe: ${s.wallet}`);
+  }
+
+  let note = '';
+  if (s.side === 'buy') {
+    if (stats) stats.buys += 1;
+    const buyers = buyersByMint.get(s.mint) ?? new Set<string>();
+    buyers.add(s.wallet);
+    buyersByMint.set(s.mint, buyers);
+    if (buyers.size > 1) note = ` ⚠ ${buyers.size} watched wallets in this token (duplicate_token case)`;
+  } else {
+    if (stats) stats.sells += 1;
+    if (s.sellPct === null) {
+      if (stats) stats.sellsWithoutPct += 1;
+      note = ' ⚠ no newTokenBalance → sell % unknown';
+    }
+    if (!buyersByMint.get(s.mint)?.has(s.wallet)) {
+      sellsWithoutSeenBuy += 1;
+      note += ' (no buy seen in this run → no_position case)';
+    }
+  }
+  pools.set(s.pool, (pools.get(s.pool) ?? 0) + 1);
+
+  const pct = s.side === 'sell' ? ` sell%=${s.sellPct === null ? '?' : s.sellPct.toFixed(1)}` : '';
+  const price = s.targetPriceSol === null ? '?' : s.targetPriceSol.toExponential(4);
+  console.log(
+    `${s.detectedAt.toISOString()} ${s.side.toUpperCase().padEnd(4)} ${short(s.wallet)} ${s.mint} ` +
+      `sol=${s.solAmount.toFixed(4)} tokens=${s.tokenAmount.toFixed(0)}${pct} pool=${s.pool} price=${price}` +
+      (dup ? ' [DUPLICATE signature]' : '') +
+      note,
+  );
+  record({ type: 'signal', signal: { ...s, detectedAt: s.detectedAt.toISOString() } });
+}
+
+function summary(final = false): void {
+  const upMin = ((Date.now() - startedAt.getTime()) / 60000).toFixed(1);
+  const blind = blindMs + (disconnectedAt ? Date.now() - disconnectedAt.getTime() : 0);
+  console.log(`\n── ${final ? 'FINAL ' : ''}summary · up ${upMin} min ──────────────────────────`);
+  for (const [w, st] of perWallet) {
+    console.log(`  ${w}  buys=${st.buys} sells=${st.sells}${st.sellsWithoutPct ? ` sells-without-%=${st.sellsWithoutPct}` : ''}`);
+  }
+  const multi = [...buyersByMint.entries()].filter(([, b]) => b.size > 1).length;
+  console.log(
+    `  pools=${JSON.stringify(Object.fromEntries(pools))} duplicate-signatures=${duplicates} ` +
+      `tokens-with-2+-wallets=${multi} sells-without-seen-buy=${sellsWithoutSeenBuy} unparsed=${unparsedCount}`,
+  );
+  console.log(`  disconnects=${disconnects} blind-time=${(blind / 1000).toFixed(0)}s${fileOk ? ` · file ${outFile}` : ''}`);
+  console.log('──────────────────────────────────────────────────────────\n');
+}
+
+const source = new PumpPortalSource({
+  apiKey,
+  url: process.env.PUMPPORTAL_WS_URL, // override only for local testing
+  log: (m) => console.log(`${new Date().toISOString()} ${m}`),
+  onSignal,
+  onUnparsed: (raw) => {
+    unparsedCount += 1;
+    console.log(`${new Date().toISOString()} [unparsed] ${typeof raw === 'string' ? raw : JSON.stringify(raw)}`);
+    record({ type: 'unparsed', raw });
+  },
+  onStatus: (st) => {
+    if (st.kind === 'disconnected') {
+      disconnects += 1;
+      disconnectedAt ??= st.at;
+      record({ type: 'gap_start', reason: st.reason });
+    } else if (st.kind === 'connected' && disconnectedAt) {
+      const gap = st.at.getTime() - disconnectedAt.getTime();
+      blindMs += gap;
+      console.log(`${st.at.toISOString()} [gap] blind for ${(gap / 1000).toFixed(1)}s — trades in this window were missed`);
+      record({ type: 'gap_end', blindMs: gap, since: disconnectedAt.toISOString() });
+      disconnectedAt = null;
+    }
+  },
 });
 
-watcher.start();
+console.log(`\n=== Hermes — PumpPortal smoke test (observe only) ===`);
+console.log(`Watching ${wallets.length} wallet(s):`);
+for (const w of wallets) console.log(`  ${w}`);
+console.log(fileOk ? `Recording to ${outFile}` : 'File output disabled — stdout only');
+console.log('Waiting for trades… (Ctrl+C to stop)\n');
+
+record({ type: 'start', wallets });
+source.setWallets(wallets);
+source.start();
+
+setInterval(() => summary(), Math.max(1, summaryMin) * 60_000).unref();
+
+function shutdown(): void {
+  summary(true);
+  record({ type: 'stop' });
+  source.stop();
+  process.exit(0);
+}
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);

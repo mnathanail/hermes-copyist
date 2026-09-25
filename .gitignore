@@ -2,11 +2,7 @@
 node_modules/
 dist/
 logs/
-.env
 *.log
 .env
 .env.*
 !.env.example
-node_modules/
-dist/
-logs/
