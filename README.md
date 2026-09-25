@@ -13,7 +13,7 @@ executes faithfully).
 ## Why this exists
 
 Started from reviewing [ahk780/pumpfun-copy-trading-bot](https://github.com/ahk780/pumpfun-copy-trading-bot)
-as a reference. Kept the good ideas (CoinVera for trade signals, SolanaPortal
+as a reference. Kept the good ideas (real-time trade signals, SolanaPortal
 + Jito for execution), but rebuilt the parts that mattered for real use:
 
 - **Server-side signing.** The reference implementation stored the raw
@@ -28,6 +28,11 @@ as a reference. Kept the good ideas (CoinVera for trade signals, SolanaPortal
   eventually, its own risk profile (see `exit_strategies`).
 - **A real risk layer before buying** (dedupe, exposure caps) — the
   reference implementation's only check was "have I seen this mint before."
+- **Reliable, widely-adopted infrastructure.** Originally built on CoinVera
+  (also what the reference bot used), but CoinVera's domain had a
+  multi-day outage mid-build. Migrated to **Helius** (transaction
+  streaming) + **Jupiter** (pricing) — see `CLAUDE.md` "Provider
+  migration" for the full story and why Helius specifically.
 
 ## Core concepts (v1)
 
@@ -49,16 +54,21 @@ as a reference. Kept the good ideas (CoinVera for trade signals, SolanaPortal
 ## Setup
 
 ```bash
-cp .env.example .env    # fill in DATABASE_URL, WALLET_PRIVATE_KEY, COINVERA_API_KEY, ...
+cp .env.example .env    # fill in DATABASE_URL, WALLET_PRIVATE_KEY, HELIUS_API_KEY, ...
 npm install
 npm run migrate         # applies src/db/migrations/001_init.sql
 npm run dev
 ```
 
+You'll need a [Helius](https://dev.helius.xyz) API key on at least the
+**Developer plan ($49/mo)** — `transactionSubscribe` (how wallet trades
+are detected) isn't available on the free tier. `JUPITER_API_KEY` is
+optional; leave it blank to use Jupiter's free `lite-api.jup.ag` tier.
+
 ## Smoke test (do this before building anything else)
 
 Before trusting the execution layer with a dashboard on top of it, verify
-the CoinVera/SolanaPortal/Jito contract against real wallets:
+the Helius/Jupiter/SolanaPortal/Jito contract against real wallets:
 
 ```bash
 # Dry run — observes real WS traffic, spends nothing:
@@ -68,23 +78,28 @@ SMOKE_TEST_WALLETS=addr1,addr2 npm run smoke-test
 SMOKE_TEST_WALLETS=addr1,addr2 SMOKE_TEST_LIVE=true npm run smoke-test
 ```
 
-Pick at least 2 actively-trading wallets so the multi-wallet subscribe
-(architecturally supported but never tested with 2+ real addresses in
-either reference implementation) gets a real check. See
-`scripts/smoke-test.ts` for what exactly it verifies.
+Pick at least 2 actively-trading wallets (pump.fun/Raydium) for a
+realistic check. See `scripts/smoke-test.ts` for what exactly it verifies,
+including a check for Jupiter's known pricing gap on pre-migration
+pump.fun tokens.
 
 ## Status
 
 Scaffold stage — core services are structured and typed against the
-finalized v1 design. The CoinVera / SolanaPortal / Jito wire contract has
-been **verified** against a second, server-side reference implementation
-by the same original author (see `CLAUDE.md` for the full diff of what
-that corrected). Remaining open items before this trades real funds:
+finalized v1 design. The Helius / Jupiter / SolanaPortal / Jito wire
+contract has been verified against official documentation (see
+`CLAUDE.md` "Provider migration" for the full story, including why
+CoinVera was dropped). Remaining open items before this trades real funds:
 
-- Multi-wallet WS subscribe is architecturally in place but not yet
-  smoke-tested end-to-end with 2+ live wallets.
+- Multi-wallet Helius subscribe (`accountInclude` supports up to 50,000
+  addresses per docs) hasn't been smoke-tested with the actual production
+  wallet count yet.
+- `dexMapper.ts`'s program-ID map is only independently verified for
+  Pump.fun; the rest are well-known constants not re-checked this session.
 - Risk guard limits and default exit-strategy numbers are placeholders.
 - No dashboard frontend yet — API + WS backend only.
+- Jupiter Price API doesn't cover very new, pre-migration pump.fun tokens
+  — flagged, not fixed.
 
 See `CLAUDE.md` for full architecture context and the reasoning behind
 each design decision, for picking this back up in a future session.
